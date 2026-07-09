@@ -8,78 +8,86 @@ import torch
 import torch.nn as nn
 from itertools import count
 import numpy as np
+import threading
 from PGUtils import pgrunner
 from JOBParser import TargetTable,FromTable,Comparison
 from ImportantConfig import Config
 config = Config()
 def zero_hc(input_dim = 1):
     return torch.zeros(input_dim,config.hidden_size,device = config.device),torch.zeros(input_dim,config.hidden_size,device = config.device)
+# Module-global column id map, mutated by getColumnId on every parse. Concurrent
+# optimize threads parse in parallel, so the check-then-assign (`if not in:
+# column_id[col] = len(column_id)`) must be serialized or two threads could
+# assign the same new column different ids (inconsistent features ↔ weights).
+# The wrapper's mtime-reload also replaces this dict under the same lock.
 column_id = {}
+_column_id_lock = threading.Lock()
 def getColumnId(column):
-    if not column in column_id:
-        column_id[column] = len(column_id)
-    return column_id[column]
+    with _column_id_lock:
+        if not column in column_id:
+            column_id[column] = len(column_id)
+        return column_id[column]
 class Sql2Vec:
     def __init__(self,):
         pass
     def to_vec(self,sql):
+        # All intermediates are LOCAL (not self.X): to_vec runs concurrently
+        # across optimize threads on this shared Sql2Vec instance, and as
+        # instance attrs two different-query calls would clobber each other's
+        # join_list / aliasname2id / join_matrix — findBestHint would then read
+        # another query's joins and the MCTS would dead-end. Returns the data
+        # findBestHint needs so it doesn't read instance attrs either.
         from psqlparse import parse_dict
-        self.sql = sql
-        import time
-        # startTime = time.time()
-        parse_result = parse_dict(self.sql)[0]["SelectStmt"]
-        self.target_table_list = [TargetTable(x["ResTarget"]) for x in parse_result["targetList"]]
-        self.from_table_list = [FromTable(x["RangeVar"]) for x in parse_result["fromClause"]]
-        if len(self.from_table_list)<2:
-            return
-        self.aliasname2fullname = {}
+        parse_result = parse_dict(sql)[0]["SelectStmt"]
+        target_table_list = [TargetTable(x["ResTarget"]) for x in parse_result["targetList"]]
+        from_table_list = [FromTable(x["RangeVar"]) for x in parse_result["fromClause"]]
+        if len(from_table_list)<2:
+            return None
 
-        self.id2aliasname = config.id2aliasname
-        self.aliasname2id = config.aliasname2id
-        # self.id2aliasname = {0: 'start', 1: 'chn', 2: 'ci', 3: 'cn', 4: 'ct', 5: 'mc', 6: 'rt', 7: 't', 8: 'k', 9: 'lt', 10: 'mk', 11: 'ml', 12: 'it1', 13: 'it2', 14: 'mi', 15: 'mi_idx', 16: 'it', 17: 'kt', 18: 'miidx', 19: 'at', 20: 'an', 21: 'n', 22: 'cc', 23: 'cct1', 24: 'cct2', 25: 'it3', 26: 'pi', 27: 't1', 28: 't2', 29: 'cn1', 30: 'cn2', 31: 'kt1', 32: 'kt2', 33: 'mc1', 34: 'mc2', 35: 'mi_idx1', 36: 'mi_idx2', 37: 'an1', 38: 'n1', 39: 'a1'}
-        # self.aliasname2id = {'kt1': 31, 'chn': 1, 'cn1': 29, 'mi_idx2': 36, 'cct1': 23, 'n': 21, 'a1': 39, 'kt2': 32, 'miidx': 18, 'it': 16, 'mi_idx1': 35, 'kt': 17, 'lt': 9, 'ci': 2, 't': 7, 'k': 8, 'start': 0, 'ml': 11, 'ct': 4, 't2': 28, 'rt': 6, 'it2': 13, 'an1': 37, 'at': 19, 'mc2': 34, 'pi': 26, 'mc': 5, 'mi_idx': 15, 'n1': 38, 'cn2': 30, 'mi': 14, 'it1': 12, 'cc': 22, 'cct2': 24, 'an': 20, 'mk': 10, 'cn': 3, 'it3': 25, 't1': 27, 'mc1': 33}
-        
-        self.join_list = set()
-        self.aliasnames_root_set = set([x.getAliasName() for x in self.from_table_list])
+        id2aliasname = config.id2aliasname
+        aliasname2id = config.aliasname2id
+        aliasname2fullname = {}
 
-        self.alias_selectivity = np.asarray([0]*len(self.id2aliasname),dtype = np.float)
-        self.aliasname2fromtable = {}
-        for table in self.from_table_list:
-            self.aliasname2fromtable[table.getAliasName()] = table
-            self.aliasname2fullname[table.getAliasName()] = table.getFullName()
-        
-        self.aliasnames = set(self.aliasname2fromtable.keys())
-        self.comparison_list =[Comparison(x) for x in parse_result["whereClause"]["BoolExpr"]["args"]]
-        self.total = 0
-        self.join_matrix = np.zeros((len(self.id2aliasname),len(self.id2aliasname)),dtype = np.float)
-        self.count_selectivity = np.asarray([0]*config.max_column,dtype = np.float)
-        self.has_predicate = set()
-        self.join_list_with_predicate = set()
-        for comparison in self.comparison_list:
+        join_list = set()
+        aliasnames_root_set = set([x.getAliasName() for x in from_table_list])
+
+        alias_selectivity = np.asarray([0]*len(id2aliasname),dtype = np.float)
+        aliasname2fromtable = {}
+        for table in from_table_list:
+            aliasname2fromtable[table.getAliasName()] = table
+            aliasname2fullname[table.getAliasName()] = table.getFullName()
+
+        aliasnames = set(aliasname2fromtable.keys())
+        comparison_list =[Comparison(x) for x in parse_result["whereClause"]["BoolExpr"]["args"]]
+        join_matrix = np.zeros((len(id2aliasname),len(id2aliasname)),dtype = np.float)
+        count_selectivity = np.asarray([0]*config.max_column,dtype = np.float)
+        has_predicate = set()
+        join_list_with_predicate = set()
+        for comparison in comparison_list:
             if len(comparison.aliasname_list) == 2:
                 left_aliasname = comparison.aliasname_list[0]
                 right_aliasname = comparison.aliasname_list[1]
-                idx0 = self.aliasname2id[left_aliasname]
-                idx1 = self.aliasname2id[right_aliasname]
+                idx0 = aliasname2id[left_aliasname]
+                idx1 = aliasname2id[right_aliasname]
                 if idx0<idx1:
-                    self.join_list.add((left_aliasname,right_aliasname))
+                    join_list.add((left_aliasname,right_aliasname))
                 else:
-                    self.join_list.add((right_aliasname,left_aliasname))
-                self.join_matrix[idx0][idx1] = 1
-                self.join_matrix[idx1][idx0] = 1
+                    join_list.add((right_aliasname,left_aliasname))
+                join_matrix[idx0][idx1] = 1
+                join_matrix[idx1][idx0] = 1
             else:
                 left_aliasname = comparison.aliasname_list[0]
-                # self.alias_selectivity[self.aliasname2id[left_aliasname]] = max(self.alias_selectivity[self.aliasname2id[left_aliasname]],pgrunner.getSelectivity(str(self.aliasname2fromtable[comparison.aliasname_list[0]]),str(comparison)))
-                self.alias_selectivity[self.aliasname2id[left_aliasname]] = self.alias_selectivity[self.aliasname2id[left_aliasname]]+pgrunner.getSelectivity(str(self.aliasname2fromtable[comparison.aliasname_list[0]]),str(comparison))
-                self.has_predicate.add(left_aliasname)
-                self.count_selectivity[getColumnId(comparison.column)] = self.count_selectivity[getColumnId(comparison.column)]+pgrunner.getSelectivity(str(self.aliasname2fromtable[comparison.aliasname_list[0]]),str(comparison))
-        for ajoin in self.join_list:
-            if ajoin[0] in self.has_predicate or ajoin[1] in self.has_predicate :
-                self.join_list_with_predicate.add(ajoin)
+                alias_selectivity[aliasname2id[left_aliasname]] = alias_selectivity[aliasname2id[left_aliasname]]+pgrunner.getSelectivity(str(aliasname2fromtable[comparison.aliasname_list[0]]),str(comparison))
+                has_predicate.add(left_aliasname)
+                count_selectivity[getColumnId(comparison.column)] = count_selectivity[getColumnId(comparison.column)]+pgrunner.getSelectivity(str(aliasname2fromtable[comparison.aliasname_list[0]]),str(comparison))
+        for ajoin in join_list:
+            if ajoin[0] in has_predicate or ajoin[1] in has_predicate :
+                join_list_with_predicate.add(ajoin)
         if config.max_column==40:
-            return np.concatenate((self.join_matrix.flatten(),self.alias_selectivity)), self.aliasnames_root_set
-        # print(np.concatenate((self.join_matrix.flatten(),self.count_selectivity)).shape)
-        return np.concatenate((self.join_matrix.flatten(),self.count_selectivity)), self.aliasnames_root_set
+            sql_vec = np.concatenate((join_matrix.flatten(),alias_selectivity))
+        else:
+            sql_vec = np.concatenate((join_matrix.flatten(),count_selectivity))
+        return sql_vec, aliasnames_root_set, id2aliasname, aliasname2id, join_list, join_list_with_predicate
 
 JOIN_TYPES = ["Nested Loop", "Hash Join", "Merge Join"]
 LEAF_TYPES = ["Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Index Scan"]

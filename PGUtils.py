@@ -1,5 +1,6 @@
 import psycopg2
 import json
+import threading
 from math import log
 from ImportantConfig import Config
 class PGConfig:
@@ -9,9 +10,39 @@ class PGConfig:
         self.maxTime = 300000
 
 latency_record_dict = {}
-# selectivity_dict = {}
+sql_log = []
+# selectivity_dict = []
 latency_record_file = None
+# Guards the module-global latency_record_dict + latency_record_file: concurrent
+# optimize threads (and the training subprocess) call addLatency, which does a
+# check-then-write on the dict and a write+flush on the shared file.
+_latency_lock = threading.Lock()
 config  = Config()
+
+class _LoggingCursor:
+    """Wraps a psycopg2 cursor to log all execute() calls to sql_log."""
+    def __init__(self, real_cursor):
+        self._real = real_cursor
+    
+    def execute(self, stmt, *args, **kwargs):
+        sql_log.append(stmt)
+        return self._real.execute(stmt, *args, **kwargs)
+    
+    def fetchall(self):
+        return self._real.fetchall()
+    
+    def fetchone(self):
+        return self._real.fetchone()
+    
+    def close(self):
+        return self._real.close()
+    
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+    
+    @property
+    def description(self):
+        return self._real.description
 
 class PGGRunner:
     def __init__(self,dbname = '',user = '',password = '',host = '',port = '',need_latency_record = True,latency_file = "RecordFile.json"):
@@ -26,7 +57,7 @@ class PGGRunner:
         """
         self.con = psycopg2.connect(database=dbname, user=user,
                                password=password, host=host, port=port)
-        self.cur = self.con.cursor()
+        self.cur = _LoggingCursor(self.con.cursor())
         self.config = PGConfig()
         self.need_latency_record = need_latency_record
 
@@ -36,7 +67,6 @@ class PGGRunner:
         if need_latency_record:
             latency_record_file = self.generateLatencyPool(latency_file)
 
-
     def generateLatencyPool(self,fileName):
         """
         :param fileName:
@@ -44,7 +74,6 @@ class PGGRunner:
         """
         import os
         import json
-        # print('in generateLatencyPool')
         
         if os.path.exists(fileName):
             f = open(fileName,"r")
@@ -60,9 +89,11 @@ class PGGRunner:
             f = open(fileName,"w")
         return f
     def addLatency(self,k,v):
-        latency_record_dict[k] =  v
-        latency_record_file.write(json.dumps([k,v])+"\n")
-        latency_record_file.flush()
+        with _latency_lock:
+            latency_record_dict[k] =  v
+            if latency_record_file is not None:
+                latency_record_file.write(json.dumps([k,v])+"\n")
+                latency_record_file.flush()
     
     def getAnalysePlanJson(self,sql,timeout=300*1000):
         if config.cost_test_for_debug:
@@ -89,7 +120,7 @@ class PGGRunner:
             self.addLatency(sql,plan_json)
         return plan_json
         
-    
+        
     def getLatency(self,sql,timeout = 300*1000):
         """
         :param sql:a sqlSample object.
@@ -110,7 +141,7 @@ class PGGRunner:
         try:
             self.cur.execute("SET geqo_threshold  = 12;")
             self.cur.execute("SET statement_timeout = "+str(timeout)+ ";")
-            self.cur.execute("explain (COSTS, FORMAT JSON, ANALYSE) "+sql)
+            self.cur.execute("explain (COSTS, FORMAT JSON, ANALYZE) "+sql)
             rows = self.cur.fetchall()
             plan_json = rows[0][0][0]
             plan_json['timeout'] = False
@@ -123,7 +154,7 @@ class PGGRunner:
             self.con.commit()
         return plan_json
         
-    
+        
     def getLatencyNoCache(self,sql,timeout = 300*1000):
         """
         :param sql:a sqlSample object.
@@ -137,7 +168,7 @@ class PGGRunner:
 
     def getResult(self, sql):
         """
-        :param sql:a sqlSample object
+        :param sql:a sqlSQL object
         :return: the latency of sql
         """
         self.cur.execute("SET statement_timeout = 300000;")
@@ -185,6 +216,36 @@ class PGGRunner:
         self.addLatency(whereCondition,-log(select_rows/total_rows))
         return latency_record_dict[whereCondition]
 
+
+class _LazyPGRunner:
+    """Lazy proxy for PGGRunner. Thread-local: each thread gets its own
+    underlying PGGRunner (own psycopg2 connection + cursor) so concurrent
+    optimize calls don't share a single cursor (which would corrupt psycopg2
+    with 'another operation in progress'). The runner is created from the
+    shared `config` DSN on first use in that thread."""
+    def __init__(self):
+        self._tls = threading.local()
+
+    def _connect(self):
+        runner = getattr(self._tls, "runner", None)
+        if runner is None:
+            runner = PGGRunner(
+                config.database, config.user, config.password,
+                config.ip, config.port,
+                need_latency_record=True,
+                latency_file=config.latency_file,
+            )
+            self._tls.runner = runner
+        return runner
+
+    def __getattr__(self, name):
+        return getattr(self._connect(), name)
+
+    def _override_runner(self, runner):
+        """Replace the underlying runner for the CURRENT thread (used by wrapper
+        to force a specific DSN)."""
+        self._tls.runner = runner
+
 from itertools import count
 from pathlib import Path
-pgrunner = PGGRunner(config.database,config.user,config.password,config.ip,config.port,need_latency_record=True,latency_file=config.latency_file)
+pgrunner = _LazyPGRunner()

@@ -177,7 +177,7 @@ class TreeNet:
         from math import e
         return loss_value,mean,variance,e**multi_value[:,config.head_num].item()
     def optimize(self):
-        fold = torchfold.Fold(cuda=True)
+        fold = torchfold.Fold(cuda=config.device.type=="cuda")
         samples,samples_idx = self.memory.sample(config.batch_size)
         target_features = []
         masks = []
@@ -200,7 +200,7 @@ class TreeNet:
         self.memory.updateWeight(samples_idx,new_weight)
         return loss_value,mean,variance,torch.exp(multi_value[:,config.head_num]).data.reshape(-1)
     def optimize_mlp(self):
-        fold = torchfold.Fold(cuda=True)
+        fold = torchfold.Fold(cuda=config.device.type=="cuda")
         samples,samples_idx = self.memory.sample(config.batch_size)
         target_features = []
         masks = []
@@ -223,7 +223,7 @@ class TreeNet:
         self.memory.updateWeight(samples_idx,new_weight)
         return loss_value,mean,variance,torch.exp(multi_value[:,config.head_num]).data.reshape(-1)
     def optimize_linear(self):
-        fold = torchfold.Fold(cuda=True)
+        fold = torchfold.Fold(cuda=config.device.type=="cuda")
         samples,samples_idx = self.memory.sample(config.batch_size)
         target_features = []
         masks = []

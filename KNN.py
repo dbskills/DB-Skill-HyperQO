@@ -61,13 +61,35 @@ class KNN:
         """
         data = (data[0],abs(data[1]))
         self.kvs.append(data)
+    def __getstate__(self):
+        # _var/_res/_cache_n are a derived cache over kvs; don't persist them
+        # (rebuilt on the first kNeighbours call after load).
+        state = self.__dict__.copy()
+        for k in ('_var', '_res', '_cache_n'):
+            state.pop(k, None)
+        return state
     def kNeighbours(self,v,k_neighbours=0):
         if k_neighbours==0:
             k_neighbours = self.k_neighbours
-        chosen_data = sorted([(self.distance(v,x[0]),x[1]) for x in self.kvs],key = lambda x:x[0])[:k_neighbours]
-        if len(self.kvs)<k_neighbours:
+        n = len(self.kvs)
+        if n < k_neighbours:
             return []
-        return chosen_data
+        # distance() is 1-D on variance only, so this is a 1-D nearest-neighbour
+        # lookup. Cache the variance (x[0][1]) and residual (x[1]) arrays (rebuild
+        # only when kvs size changes — inserts append, _persist may trim) and use
+        # np.argpartition (O(n)) instead of a per-call Python sort (O(n log n)
+        # over the whole store) that dominated with a large KNN.
+        if getattr(self, '_cache_n', -1) != n:
+            self._var = np.fromiter((x[0][1] for x in self.kvs), dtype=np.float64, count=n)
+            self._res = np.fromiter((x[1] for x in self.kvs), dtype=np.float64, count=n)
+            self._cache_n = n
+        d = np.abs(self._var - float(v[1]))
+        if n > k_neighbours:
+            part = np.argpartition(d, k_neighbours)[:k_neighbours]
+            order = part[np.argsort(d[part])]
+        else:
+            order = np.argsort(d)
+        return [(float(d[i]), float(self._res[i])) for i in order]
     def kNeightboursSample(self,v,k_neighbours=0):
         k_neighbours = self.kNeighbours(v,k_neighbours)
         if len(k_neighbours)==0 or k_neighbours[-1][0]>self.max_distance:

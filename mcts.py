@@ -67,7 +67,7 @@ def randomPolicy(node):
             temp = node.state.getPossibleActions()
             action = random.choice(list(temp))
         except IndexError:
-            raise Exception("Non-terminal state has no possible actions: " + str(state))
+            raise Exception("Non-terminal state has no possible actions: " + str(node.state))
         newNode = treeNode(node.state.takeAction(action), node)
         node.children[action] = newNode
         if len(node.state.getPossibleActions()) == len(node.children):
@@ -318,34 +318,41 @@ class MCTSHinterSearch():
         self.Utility=[]
         self.total_cnt = 0
         self.modelhead = config.log_file.split("/")[-1].split(".txt")[0]
-    def dfs(self,node,depth):
+    def dfs(self,node,depth,utility):
         if (node.state.currentStep==depth):
             nodeValue = node.totalReward / node.numVisits
-            self.Utility.append((node.state.order_list, eflog(nodeValue)))
+            utility.append((node.state.order_list, eflog(nodeValue)))
             return
         for child in node.children.values():
-            self.dfs(child,depth)
+            self.dfs(child,depth,utility)
     def  savemodel(self,):
         torch.save(predictionNet.cpu().state_dict(), 'model/'+self.modelhead+".pth")
-        predictionNet.cuda()
+        predictionNet.to(config.cpudevice)
     def loadmodel(self,):
         predictionNet.load_state_dict(torch.load('model/'+self.modelhead+".pth"))
-        predictionNet.cuda()
+        predictionNet.to(config.cpudevice)
     def findCanHints(self, totalNumberOfTables, numberOfTables, queryEncode,all_joins,joins_with_predicate,nodes,depth=2):
         self.total_cnt +=1
-        if self.total_cnt%200==0:
-            self.savemodel()
+        # NOTE: the periodic self.savemodel() (every 200 calls) is intentionally
+        # removed in the server model. It did an in-place torch.save/load of
+        # the module-global predictionNet — a foreground side-effect that races
+        # with concurrent predict calls and with the mtime-reload. Model
+        # checkpointing is the training subprocess's job (run_training -> _persist).
         initialState = planState(totalNumberOfTables, numberOfTables, queryEncode,
                                 all_joins,joins_with_predicate,nodes)
-        
+
         searchFactor = config.searchFactor
         currentState = initialState
         # print(len(currentState.getPossibleActions()))
-        self.mct = mcts(iterationLimit=(int)(len(currentState.getPossibleActions()) *  searchFactor)) 
-        self.Utility = []
-        self.mct.search(initialState = currentState)
-        self.dfs(self.mct.root, depth)
-        benefit_top_hints = sorted(self.Utility,key = lambda x :x[1],reverse=True)
+        # mct + utility are LOCAL (not self.mct/self.Utility): findCanHints runs
+        # concurrently across optimize threads, and as instance attrs two calls
+        # would clobber each other's tree (self.dfs(self.mct.root) could walk
+        # another thread's tree -> "non-terminal state has no actions").
+        mct = mcts(iterationLimit=(int)(len(currentState.getPossibleActions()) *  searchFactor))
+        utility = []
+        mct.search(initialState = currentState)
+        self.dfs(mct.root, depth, utility)
+        benefit_top_hints = sorted(utility,key = lambda x :x[1],reverse=True)
         # print("-----start benefit------")
         # for x in benefit_top_hints[:2]:
         #     print(x[0][:10],eflog(x[1]),x[1])
