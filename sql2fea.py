@@ -1,7 +1,7 @@
 import sys
 sys.path.append(".")
 
-from JOBParser import TargetTable,FromTable,Comparison
+from JOBParser import TargetTable,FromTable,Comparison,set_bare_column_resolver,UnresolvedColumn,UnsupportedSQL,UnsupportedExpr
 # max_column_in_table = 15
 import torch
 import torch
@@ -27,6 +27,13 @@ def getColumnId(column):
         if not column in column_id:
             column_id[column] = len(column_id)
         return column_id[column]
+
+# Per-DSN schema cache: {table_fullname: set(column_names)} for the bare-column
+# resolver. JOB is alias-qualified -> never consulted.
+_schema_columns = {}
+def set_schema_columns(m):
+    global _schema_columns
+    _schema_columns = m
 class Sql2Vec:
     def __init__(self,):
         pass
@@ -40,7 +47,11 @@ class Sql2Vec:
         from psqlparse import parse_dict
         parse_result = parse_dict(sql)[0]["SelectStmt"]
         target_table_list = [TargetTable(x["ResTarget"]) for x in parse_result["targetList"]]
-        from_table_list = [FromTable(x["RangeVar"]) for x in parse_result["fromClause"]]
+        from_clause = parse_result.get("fromClause", [])
+        for _entry in from_clause:
+            if "RangeVar" not in _entry:
+                raise UnsupportedSQL("derived-table (subquery in FROM) not supported by HyperQO parser")
+        from_table_list = [FromTable(x["RangeVar"]) for x in from_clause]
         if len(from_table_list)<2:
             return None
 
@@ -58,7 +69,36 @@ class Sql2Vec:
             aliasname2fullname[table.getAliasName()] = table.getFullName()
 
         aliasnames = set(aliasname2fromtable.keys())
-        comparison_list =[Comparison(x) for x in parse_result["whereClause"]["BoolExpr"]["args"]]
+        _wc = parse_result.get("whereClause")
+        if _wc is None:
+            _wc_args = []
+        elif "BoolExpr" in _wc:
+            _wc_args = _wc["BoolExpr"]["args"]
+        else:
+            # Single predicate or SubLink node — wrap so Comparison can attempt it.
+            _wc_args = [_wc]
+        # Bare-column resolver: binds a single-field ColumnRef to its owning
+        # FROM-alias via the cached schema. JOB is 2-field -> never consulted.
+        def _resolve_bare_column(colname, _a2f=aliasname2fullname,
+                                 _sc=_schema_columns, _cache={}):
+            if colname in _cache:
+                return _cache[colname]
+            for _alias, _fullname in _a2f.items():
+                if colname in _sc.get(_fullname, ()):
+                    _cache[colname] = _alias
+                    return _alias
+            _cache[colname] = None
+            return None
+        set_bare_column_resolver(_resolve_bare_column)
+        try:
+            comparison_list = []
+            for _arg in _wc_args:
+                try:
+                    comparison_list.append(Comparison(_arg))
+                except UnresolvedColumn:
+                    pass
+        finally:
+            set_bare_column_resolver(None)
         join_matrix = np.zeros((len(id2aliasname),len(id2aliasname)),dtype = np.float)
         count_selectivity = np.asarray([0]*config.max_column,dtype = np.float)
         has_predicate = set()
@@ -173,19 +213,17 @@ class TreeBuilder:
             return np.asarray([self.aliasname2id[node["Alias"]]])
 
         if node["Node Type"] == "Bitmap Index Scan":
-            # find the first (longest) relation name that appears in the index name
-            name_key = "Index Cond" #if "Index Cond" in node else "Relation Name"
-            if name_key not in node:
-                print(node)
-                raise TreeBuilderError("Bitmap operator did not have an index name or a relation name")
-            for rel in self.aliasname2id:
-                if rel+'.' in node[name_key]:
-                    return np.asarray([-1])
-                    return np.asarray([self.aliasname2id[rel]])
+            # Leaf under a Bitmap Heap Scan, whose "Alias" (the real alias --
+            # the AS-alias for JOB, the relname for TPC-H bare tables) is
+            # propagated by plan_to_feature_tree. The leaf itself resolves to
+            # no standalone alias: JOB Index Cond is alias-prefixed, TPC-H is
+            # bare. Return the -1 sentinel uniformly for both.
+            return np.asarray([-1])
 
-        #     raise TreeBuilderError("Could not find relation name for bitmap index scan")
         print(node)
-        raise TreeBuilderError("Cannot extract Alias type from node")
+        raise TreeBuilderError(
+            "Cannot extract Alias: %s node has no Alias"
+            % node.get("Node Type", "?"))
                 
     def __featurize_join(self, node):
         assert is_join(node)

@@ -124,36 +124,41 @@ def parse_dsn(dsn):
             parts.get("host", "127.0.0.1"), int(parts.get("port", "5432")))
 
 
-def extract_aliases_from_query(sql):
-    from psqlparse import parse_dict
-    try:
-        parse_result = parse_dict(sql)[0]["SelectStmt"]
-        aliases = []
-        for item in parse_result.get("fromClause", []):
-            range_var = item.get("RangeVar", {})
-            if "alias" in range_var:
-                alias_name = range_var["alias"]["Alias"]["aliasname"]
-            else:
-                alias_name = range_var.get("relname", "")
-            aliases.append(alias_name)
-        return aliases
-    except Exception:
-        return []
+def _fetch_schema_columns(dsn):
+    """Fetch {table_fullname: set(column_names)} from pg_catalog for the DSN.
+    Used by the bare-column resolver to bind TPC-H-style unqualified columns
+    to their owning FROM-alias. Cached per-DSN by the skill."""
+    import psycopg2
+    dbname, user, password, host, port = parse_dsn(dsn)
+    conn = psycopg2.connect(database=dbname, user=user, password=password,
+                            host=host, port=port)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT c.relname, a.attname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        WHERE c.relkind = 'r'
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND a.attnum > 0 AND NOT a.attisdropped
+    """)
+    tables = {}
+    for relname, attname in cur.fetchall():
+        tables.setdefault(relname, set()).add(attname)
+    cur.close()
+    conn.close()
+    return tables
 
 
-def build_dynamic_alias_map(base_id2aliasname, base_aliasname2id, query_aliases, config_alias_overrides):
+def apply_alias_overrides(base_id2aliasname, base_aliasname2id, config_alias_overrides, max_alias_num=40):
     id2aliasname = dict(base_id2aliasname)
     aliasname2id = dict(base_aliasname2id)
     if config_alias_overrides and "aliasname2id" in config_alias_overrides:
         for alias_name, alias_id in config_alias_overrides["aliasname2id"].items():
+            if alias_id >= max_alias_num:
+                continue
             aliasname2id[alias_name] = alias_id
             id2aliasname[alias_id] = alias_name
-    next_id = (max(id2aliasname.keys()) + 1) if id2aliasname else 1
-    for alias_name in query_aliases:
-        if alias_name and alias_name not in aliasname2id:
-            aliasname2id[alias_name] = next_id
-            id2aliasname[next_id] = alias_name
-            next_id += 1
     return id2aliasname, aliasname2id
 
 
@@ -185,13 +190,13 @@ class HyperQOSkill:
         self._shutting_down = False  # set by persist(); /optimize then 503s
         self._persist_lock = threading.Lock()  # single-flight: concurrent /shutdown runs persist once
         self._last_mtime = 0  # max mtime across persisted files at last reload
+        self._schema_cols_cache = {}  # per-DSN {table: set(cols)} for bare-column resolution
         self.trained_samples = 0  # queries processed by training subprocesses (synced via reload)
         self._drain_thread = None  # catch-up drainer; started by start_drainer() in the server only
 
     def _paths(self):
         state_file = os.path.join(self.state_dir, "hinter_state.pkl")
         column_id_file = os.path.join(self.state_dir, "column_id.pkl")
-        alias_map_file = os.path.join(self.state_dir, "alias_map.pkl")
         value_net = os.path.join(self.model_dir, "value_network.pth")
         value_net_opt = os.path.join(self.model_dir, "value_network_optimizer.pth")
         mcts_opt = os.path.join(self.model_dir, "mcts_optimizer.pth")
@@ -199,7 +204,7 @@ class HyperQOSkill:
             self.model_dir,
             self.config.log_file.split("/")[-1].split(".txt")[0] + ".pth",
         )
-        return (state_file, column_id_file, alias_map_file, value_net,
+        return (state_file, column_id_file, value_net,
                 value_net_opt, mcts_opt, mcts_model)
 
     def _pending_file(self):
@@ -224,16 +229,6 @@ class HyperQOSkill:
         # cost of latency. Both are --config-overridable (see SKILL.md).
         config.leading_length = -1
         self.config = config
-
-        alias_map_file = os.path.join(self.state_dir, "alias_map.pkl")
-        if os.path.exists(alias_map_file):
-            try:
-                with open(alias_map_file, "rb") as f:
-                    persisted = pickle.load(f)
-                config.id2aliasname = persisted.get("id2aliasname", config.id2aliasname)
-                config.aliasname2id = persisted.get("aliasname2id", config.aliasname2id)
-            except Exception:
-                pass
 
         ImportantConfig.config = config
         ImportantConfig.Config = lambda: config
@@ -272,12 +267,12 @@ class HyperQOSkill:
         self._last_mtime = self._model_mtime()
 
     def _restore_state_from_disk(self):
-        """In-place load of model weights + KNN + replay + alias map + column_id
+        """In-place load of model weights + KNN + replay + column_id
         into the existing objects. Used by `_load` (initial hydrate / model_dir
         change, under _load_lock or at first request). NOT safe for concurrent
         readers (use _maybe_reload_model for that)."""
         config = self.config
-        (state_file, column_id_file, alias_map_file, value_net, value_net_opt,
+        (state_file, column_id_file, value_net, value_net_opt,
          mcts_opt, mcts_model) = self._paths()
 
         if os.path.exists(value_net):
@@ -309,14 +304,6 @@ class HyperQOSkill:
             try:
                 with open(column_id_file, "rb") as f:
                     sql2fea_mod.column_id = pickle.load(f)
-            except Exception:
-                pass
-        if os.path.exists(alias_map_file):
-            try:
-                with open(alias_map_file, "rb") as f:
-                    persisted = pickle.load(f)
-                config.id2aliasname = persisted.get("id2aliasname", config.id2aliasname)
-                config.aliasname2id = persisted.get("aliasname2id", config.aliasname2id)
             except Exception:
                 pass
 
@@ -355,7 +342,7 @@ class HyperQOSkill:
         if mt == self._last_mtime:
             return
         config = self.config
-        (state_file, column_id_file, alias_map_file, value_net, value_net_opt,
+        (state_file, column_id_file, value_net, value_net_opt,
          mcts_opt, mcts_model) = self._paths()
         import sql2fea as sql2fea_mod
 
@@ -408,15 +395,6 @@ class HyperQOSkill:
                     sql2fea_mod.column_id = cid
             except Exception as e:
                 print(f"column_id reload failed: {e}", file=sys.stderr)
-        # alias map: reassign config attrs (atomic).
-        if os.path.exists(alias_map_file):
-            try:
-                with open(alias_map_file, "rb") as f:
-                    persisted = pickle.load(f)
-                config.id2aliasname = persisted.get("id2aliasname", config.id2aliasname)
-                config.aliasname2id = persisted.get("aliasname2id", config.aliasname2id)
-            except Exception as e:
-                print(f"alias_map reload failed: {e}", file=sys.stderr)
         self._last_mtime = mt
 
     def ensure_loaded(self, config_overrides):
@@ -429,6 +407,17 @@ class HyperQOSkill:
                     self.model_dir = model_dir
                     os.makedirs(self.model_dir, exist_ok=True)
                     self._load()
+
+    def _ensure_schema_columns(self, dsn, sql2fea_mod):
+        if dsn in self._schema_cols_cache:
+            sql2fea_mod.set_schema_columns(self._schema_cols_cache[dsn])
+            return
+        try:
+            schema = _fetch_schema_columns(dsn)
+        except Exception:
+            schema = {}
+        self._schema_cols_cache[dsn] = schema
+        sql2fea_mod.set_schema_columns(schema)
 
     def optimize(self, dsn, query, optimize_only, config_overrides, inspect_sql):
         # Lock-free critical path. _maybe_reload_model is a snapshot-swap (no
@@ -448,10 +437,9 @@ class HyperQOSkill:
         # The thread-local pgrunner proxy connects from `config` on first use
         # in this thread → own connection + cursor.
 
-        query_aliases = extract_aliases_from_query(query)
-        id2aliasname, aliasname2id = build_dynamic_alias_map(
+        id2aliasname, aliasname2id = apply_alias_overrides(
             self.config.id2aliasname, self.config.aliasname2id,
-            query_aliases, config_overrides,
+            config_overrides, self.config.max_alias_num,
         )
         self.config.id2aliasname = id2aliasname
         self.config.aliasname2id = aliasname2id
@@ -461,6 +449,11 @@ class HyperQOSkill:
             if hasattr(self.config, k):
                 setattr(self.config, k, v)
 
+        # Sync the TreeBuilder's alias map (captured once at _load) with the
+        # per-call rebuild; without it, non-IMDB aliases KeyError in featurization.
+        self.tree_builder.aliasname2id = aliasname2id
+        self._ensure_schema_columns(dsn, sql2fea_mod)
+
         self.hinter.optimize_only = True  # foreground is ALWAYS cost-only: no
         # EXPLAIN ANALYZE, no execution, no training on the critical path. The
         # actual execution + training runs in a separate process (see
@@ -468,10 +461,14 @@ class HyperQOSkill:
         # request and enough pending queries accumulate.
 
         start_time = time.time()
+        # Guard the post-try enqueue: hinter_latency/pg_latency are only bound
+        # on success, else UnboundLocalError -> HTTP 500 on the degrade path.
+        success = False
         try:
             (pg_plan_time, pg_latency, mcts_time, hinter_plan_time, MPHE_time,
              hinter_latency, chosen_plan, hinter_time) = self.hinter.hinterRun(query)
             optimization_time = time.time() - start_time
+            success = True
             if chosen_plan and chosen_plan[0] != "PG":
                 optimized_query = chosen_plan[0] + " " + query
             else:
@@ -492,16 +489,21 @@ class HyperQOSkill:
                     "pg_latency_ms": round(pg_latency, 2),
                     "hinter_latency_ms": round(hinter_latency, 2),
                     "chosen_plan": chosen_plan,
+                    "model_dir": self.model_dir,
+                    "state_dir": self.state_dir,
                 },
             }
         except Exception as e:
+            # Degrade for SQL forms psqlparse can't handle (CTE/JOIN-ON/subquery).
             result = {
                 "optimized_query": query,
                 "metadata": {
                     "strategy_type": "hybrid-mcts-learning",
                     "optimization_time": round(time.time() - start_time, 4),
                     "estimated_impact": 0.0,
-                    "error": str(e),
+                    "note": f"unsupported-sql: {e}",
+                    "model_dir": self.model_dir,
+                    "state_dir": self.state_dir,
                 },
             }
 
@@ -510,20 +512,18 @@ class HyperQOSkill:
 
         # Training-mode: append the query to the pending queue so the training
         # subprocess will re-execute it (EXPLAIN ANALYZE) + train. Optimize-only
-        # enqueues nothing (no execution). The safe-gate skips enqueueing when
-        # the chosen plan is catastrophically costlier than PG's default (would
-        # hang the subprocess on a doomed execution). Spawning (and background
-        # catch-up) is handled by _try_start_training.
-        if not optimize_only and not _cost_ratio_too_high(hinter_latency, pg_latency):
+        # enqueues nothing. The safe-gate skips enqueueing when the chosen plan
+        # is catastrophically costlier than PG's default. Skipped on the degrade
+        # path (success=False) so an unsupported query isn't queued.
+        if success and not optimize_only and not _cost_ratio_too_high(hinter_latency, pg_latency):
             self._append_pending(query, dsn, sql2fea_mod)
             self._try_start_training()
         return result
 
     # -- Pending training queue + subprocess spawn --
     def _append_pending(self, query, dsn, sql2fea_mod):
-        """Persist lightweight state (alias_map + column_id) so the training
-        subprocess trains with ids consistent with prediction, and append the
-        query to the pending file. Spawning is decided by _try_start_training
+        """Persist column_id so the training subprocess trains with ids
+        consistent with prediction, and append the query to the pending file. Spawning is decided by _try_start_training
         (called from the foreground and the background drainer). column_id is
         read under its lock so the pickle isn't torn by a concurrent
         getColumnId."""
@@ -587,19 +587,9 @@ class HyperQOSkill:
             time.sleep(2 if in_progress else 5)
 
     def _persist_lightweight(self, sql2fea_mod):
-        """Atomically persist only the alias map + column_id (cheap, training-
-        mode per query) so the training subprocess loads the foreground's
-        latest alias/column ids and trains with ids consistent with prediction."""
-        alias_map_file = os.path.join(self.state_dir, "alias_map.pkl")
+        """Atomically persist column_id so the training subprocess trains with
+        ids consistent with prediction."""
         column_id_file = os.path.join(self.state_dir, "column_id.pkl")
-        try:
-            alias_bytes = pickle.dumps({
-                "id2aliasname": self.config.id2aliasname,
-                "aliasname2id": self.config.aliasname2id,
-            })
-            _atomic_write_bytes(alias_map_file, alias_bytes)
-        except Exception:
-            pass
         try:
             with sql2fea_mod._column_id_lock:
                 column_bytes = pickle.dumps(sql2fea_mod.column_id)
@@ -642,19 +632,20 @@ class HyperQOSkill:
         the same plan the foreground already returned; execution + training
         happen here."""
         import PGUtils
+        import sql2fea as sql2fea_mod
         database, user, password, host, port = parse_dsn(dsn)
         self.config.database = database
         self.config.user = user
         self.config.password = password
         self.config.ip = host
         self.config.port = port
-        # Re-merge aliases defensively (the foreground persisted them already,
-        # but this keeps ids consistent if a query alias was missed on disk).
-        query_aliases = extract_aliases_from_query(sql)
-        id2aliasname, aliasname2id = build_dynamic_alias_map(
-            self.config.id2aliasname, self.config.aliasname2id, query_aliases, None)
+        id2aliasname, aliasname2id = apply_alias_overrides(
+            self.config.id2aliasname, self.config.aliasname2id, None,
+            self.config.max_alias_num)
         self.config.id2aliasname = id2aliasname
         self.config.aliasname2id = aliasname2id
+        self.tree_builder.aliasname2id = aliasname2id
+        self._ensure_schema_columns(dsn, sql2fea_mod)
         self.hinter.optimize_only = False
         try:
             with redirect_stdout(io.StringIO()):
@@ -669,12 +660,14 @@ class HyperQOSkill:
         weights via _maybe_reload_model on the next request. Runs on a daemon
         thread so the foreground /optimize returns immediately."""
         model_dir = self.model_dir
+        alias_arg = json.dumps(self.config.aliasname2id)
 
         def _run():
             try:
                 p = subprocess.Popen(
                     [sys.executable, os.path.abspath(__file__),
-                     "--train", "--model-dir", model_dir]
+                     "--train", "--model-dir", model_dir,
+                     "--aliasname2id", alias_arg]
                 )
                 with self._state_lock:
                     self._train_proc = p
@@ -703,7 +696,7 @@ class HyperQOSkill:
         """Full snapshot + atomic write of all state. Called from the training
         subprocess (single-threaded) and from persist()'s final-training
         subprocess — never from a context with concurrent readers, so no lock."""
-        (state_file, column_id_file, alias_map_file, value_net, value_net_opt,
+        (state_file, column_id_file, value_net, value_net_opt,
          mcts_opt, mcts_model) = self._paths()
 
         try:
@@ -723,10 +716,6 @@ class HyperQOSkill:
         })
         with sql2fea_mod._column_id_lock:
             column_bytes = pickle.dumps(sql2fea_mod.column_id)
-        alias_bytes = pickle.dumps({
-            "id2aliasname": self.config.id2aliasname,
-            "aliasname2id": self.config.aliasname2id,
-        })
         # Clone each state_dict independently. Optimizer state_dicts are nested
         # (dict/list values, not tensors), so _clone_state_dict deep-copies
         # them; a failure on one must not discard the others.
@@ -751,7 +740,6 @@ class HyperQOSkill:
 
         _atomic_write_bytes(state_file, state_bytes)
         _atomic_write_bytes(column_id_file, column_bytes)
-        _atomic_write_bytes(alias_map_file, alias_bytes)
         if vw_sd is not None:
             _atomic_torch_save(vw_sd, value_net)
         if opt_sd is not None:
@@ -789,7 +777,8 @@ class HyperQOSkill:
                 try:
                     p = subprocess.Popen(
                         [sys.executable, os.path.abspath(__file__),
-                         "--train", "--model-dir", self.model_dir]
+                         "--train", "--model-dir", self.model_dir,
+                         "--aliasname2id", json.dumps(self.config.aliasname2id)]
                     )
                     p.wait(timeout=600)
                 except subprocess.TimeoutExpired:
@@ -823,7 +812,7 @@ class HyperQOSkill:
             "trained_samples": self.trained_samples,
             "net_memory_len": len(self.net.memory.memory),
             "mcts_memory_len": len(self.mcts_searcher.memory.memory),
-            "alias_count": len(self.config.aliasname2id),
+            "alias_count": len(self.config.id2aliasname),
             "model_dir": self.model_dir,
             "train_trigger": self.train_trigger,
         }
@@ -847,11 +836,29 @@ class HyperQOSkill:
 # Training subprocess entry: load state from disk, process all pending
 # training queries, save atomically. Invoked as `wrapper.py --train`.
 # --------------------------------------------------------------------------- #
-def run_training(model_dir):
+def run_training(model_dir, aliasname2id_json=None):
     os.makedirs(model_dir, exist_ok=True)
     runner = HyperQOSkill()
     runner.model_dir = model_dir
     runner._load()  # fresh Hinter + net + mcts, state hydrated from disk
+    if aliasname2id_json:
+        try:
+            amap = json.loads(aliasname2id_json)
+            # Merge the override into the 40-entry base id2aliasname (as the
+            # foreground does via apply_alias_overrides), NOT replace it.
+            # Replacing with {v:k} leaves only the live N aliases ->
+            # to_vec sizes join_matrix N x N and alias_selectivity N, so the
+            # sql_vec width (N*N+max_column) no longer matches the model's
+            # sql_layer (max_alias_num^2 + max_column = 1700) -> matmul shape
+            # mismatch, AND alias_selectivity[alias_id] is out-of-bounds for
+            # ids >= N. Merging keeps the 40-padding so widths/indices hold.
+            id2a, a2id = apply_alias_overrides(
+                runner.config.id2aliasname, runner.config.aliasname2id,
+                {"aliasname2id": amap}, runner.config.max_alias_num)
+            runner.config.id2aliasname = id2a
+            runner.config.aliasname2id = a2id
+        except Exception as e:
+            print(f"aliasname2id arg parse failed: {e}", file=sys.stderr)
     queries, processing = runner._claim_pending()
     if not queries:
         if processing is not None:
@@ -969,10 +976,12 @@ def main():
                         help="Run one training cycle on pending queries and exit (subprocess mode).")
     parser.add_argument("--model-dir", default=None,
                         help="Model directory (for --train mode).")
+    parser.add_argument("--aliasname2id", default=None,
+                        help="JSON aliasname2id map (for --train mode).")
     args = parser.parse_args()
 
     if args.train:
-        sys.exit(run_training(args.model_dir or MODEL_DIR))
+        sys.exit(run_training(args.model_dir or MODEL_DIR, args.aliasname2id))
 
     if not args.port:
         print("error: --port or PORT env required", file=sys.stderr)
