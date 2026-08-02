@@ -1,11 +1,51 @@
 from tkinter import E
 import numpy as np
+
+
+class UnresolvedColumn(Exception):
+    """Bare column can't bind to a FROM-table (e.g. CTE-derived); the owning
+    comparison is skipped so the query degrades instead of crashing."""
+    pass
+
+
+class UnsupportedExpr(Exception):
+    """An expression/value form the parser doesn't handle (e.g. a SubLink
+    scalar-subquery rexpr, A_Expr date+interval arithmetic). Raised instead
+    of a bare string so the degrade note names the real reason, not
+    'exceptions must derive from BaseException'."""
+    pass
+
+
+class UnsupportedSQL(Exception):
+    """A SQL construct HyperQO can't optimize (e.g. derived-table
+    RangeSubselect in FROM)."""
+    pass
+
+
+# Module-level bare-column resolver: bare column name -> owning FROM-alias.
+# Set by to_vec around comparison-list construction; JOB queries are 2-field
+# ColumnRefs so it's never consulted.
+_bare_column_resolver = None
+
+
+def set_bare_column_resolver(fn):
+    global _bare_column_resolver
+    _bare_column_resolver = fn
+
+
 class Expr:
     def __init__(self, expr,list_kind = 0):
         self.expr = expr
         self.list_kind = list_kind
         self.isInt = False
         self.val = 0
+        # Eagerly resolve a bare ColumnRef to its owning alias, cached so later
+        # str()/getAliasName() (after the resolver clears) still work.
+        self._resolved_alias = None
+        if isinstance(expr, dict) and "ColumnRef" in expr:
+            fields = expr["ColumnRef"]["fields"]
+            if len(fields) == 1 and _bare_column_resolver is not None:
+                self._resolved_alias = _bare_column_resolver(fields[0]["String"]["str"])
     def isCol(self,):
         return isinstance(self.expr, dict) and "ColumnRef" in self.expr
 
@@ -19,24 +59,42 @@ class Expr:
                 self.val = value["Integer"]["ival"]
                 return str(value["Integer"]["ival"])
             else:
-                raise "unknown Value in Expr"
+                raise UnsupportedExpr("unknown A_Const value: " + str(list(value.keys())))
         elif "TypeCast" in value_expr:
-            if len(value_expr["TypeCast"]['typeName']['TypeName']['names'])==1:
-                return value_expr["TypeCast"]['typeName']['TypeName']['names'][0]['String']['str']+" '"+value_expr["TypeCast"]['arg']['A_Const']['val']['String']['str']+"'"
-            else:
-                if value_expr["TypeCast"]['typeName']['TypeName']['typmods'][0]['A_Const']['val']['Integer']['ival']==2:
-                    return value_expr["TypeCast"]['typeName']['TypeName']['names'][1]['String']['str']+" '"+value_expr["TypeCast"]['arg']['A_Const']['val']['String']['str']+ "' month"
-                else:
-                    return value_expr["TypeCast"]['typeName']['TypeName']['names'][1]['String']['str']+" '"+value_expr["TypeCast"]['arg']['A_Const']['val']['String']['str']+ "' year"
+            _tc = value_expr["TypeCast"]
+            _tn = _tc['typeName']['TypeName']
+            _val = _tc['arg']['A_Const']['val']['String']['str']
+            if len(_tn['names']) == 1:
+                return _tn['names'][0]['String']['str'] + " '" + _val + "'"
+            # 2-name qualified type (pg_catalog.timestamp / .interval).
+            # typmods (precision modifiers) only exist for some types; a bare
+            # ::timestamp has none -> plain qualified-name cast.
+            _typmods = _tn.get('typmods')
+            if _typmods and _typmods[0]['A_Const']['val']['Integer']['ival'] == 2:
+                return _tn['names'][1]['String']['str'] + " '" + _val + "' month"
+            if _typmods:
+                return _tn['names'][1]['String']['str'] + " '" + _val + "' year"
+            return _tn['names'][1]['String']['str'] + " '" + _val + "'"
         else:
             print(value_expr.keys())
-            raise "unknown Value in Expr"
+            raise UnsupportedExpr("unknown value expr: " + str(list(value_expr.keys())))
+
+    def _fields(self):
+        return self.expr["ColumnRef"]["fields"]
 
     def getAliasName(self,):
-        return self.expr["ColumnRef"]["fields"][0]["String"]["str"]
+        fields = self._fields()
+        if len(fields) >= 2:
+            return fields[0]["String"]["str"]
+        if self._resolved_alias is not None:
+            return self._resolved_alias
+        raise UnresolvedColumn(fields[0]["String"]["str"])
 
     def getColumnName(self,):
-        return self.expr["ColumnRef"]["fields"][1]["String"]["str"]
+        fields = self._fields()
+        if len(fields) >= 2:
+            return fields[1]["String"]["str"]
+        return fields[0]["String"]["str"]
 
     def __str__(self,):
         if self.isCol():
@@ -51,10 +109,10 @@ class Expr:
             elif self.list_kind == 10:
                 return " AND ".join([self.getValue(x) for x in self.expr])
             else:
-                raise "list kind error"
+                raise UnsupportedExpr("unsupported list kind: " + str(self.list_kind))
 
         else:
-            raise "No Known type of Expr"
+            raise UnsupportedExpr("unsupported expr: " + str(list(self.expr.keys()) if isinstance(self.expr, dict) else type(self.expr).__name__))
 
 
 class TargetTable:
@@ -175,7 +233,7 @@ class Comparison:
             else:
                 import json
                 print(json.dumps(self.comparison, sort_keys=True, indent=4))
-                raise "Operation ERROR"
+                raise UnsupportedExpr("unsupported comparison kind: " + str(self.kind))
             return str(self.lexpr)+" "+Op+" "+str(self.rexpr)
         elif self.comp_kind == 1:
             if self.kind == 1:

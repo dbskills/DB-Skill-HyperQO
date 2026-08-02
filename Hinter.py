@@ -35,6 +35,13 @@ class Hinter:
         self.hinter_times = 0
 
     def findBestHint(self,plan_json_PG,alias,sql_vec,sql,id2aliasname,aliasname2id,join_list,join_list_with_predicate,mcts_time_list,MHPE_time_list):
+        if sql_vec is None or len(alias) < 2:
+            # Single-FROM-table or unparseable WHERE: no join to reorder. Skip
+            # MCTS (planState would torch.tensor(None) and crash) -> PG wins.
+            # Keep the time lists non-empty for hinterRun's length assert.
+            mcts_time_list.append(0.0)
+            MHPE_time_list.append(0.0)
+            return [], None
         alias_id = [aliasname2id[a] for a in alias]
         timer.reset('mcts_time_list')
         id_joins_with_predicate = [(aliasname2id[p[0]],aliasname2id[p[1]]) for p in join_list_with_predicate]
@@ -109,8 +116,11 @@ class Hinter:
         # forward is deterministic (Dropout is defined but never called), so a
         # separate standalone forward over [PG] alone would be pure redundancy.
         chosen_leading_pair, pg_value = self.findBestHint(plan_json_PG=plan_json_PG,alias=alias,sql_vec = sql_vec,sql=sql,id2aliasname=id2aliasname,aliasname2id=aliasname2id,join_list=join_list,join_list_with_predicate=join_list_with_predicate,mcts_time_list=mcts_time_list,MHPE_time_list=MHPE_time_list)
-        knn_plan = abs(self.knn.kNeightboursSample(pg_value))
-        if chosen_leading_pair[0][0]<pg_value[0] and abs(knn_plan)<config.threshold and self.value_extractor.decode(pg_value[0])>100:
+        if pg_value is None:
+            knn_plan = None
+        else:
+            knn_plan = abs(self.knn.kNeightboursSample(pg_value))
+        if chosen_leading_pair and pg_value is not None and knn_plan is not None and chosen_leading_pair[0][0]<pg_value[0] and abs(knn_plan)<config.threshold and self.value_extractor.decode(pg_value[0])>100:
             from math import e
             max_time_out = min(int(self.value_extractor.decode(chosen_leading_pair[0][0])*3),config.max_time_out)
             if self.optimize_only:
@@ -177,18 +187,23 @@ class Hinter:
                 ##To do: parallel planning
 
                 hinter_planningtime_list.append(pgrunner.getAnalysePlanJson(sql = sql)['Planning Time'])
-            if not self.optimize_only:
+            if not self.optimize_only and pg_value is not None:
                 self.knn.insertAValue((pg_value,self.value_extractor.encode(pg_time_flag[0])-pg_value[0]))
             samples_plan_with_time.append([plan_json_PG,pg_time_flag[0],mask])
             hinter_time_list.append([pg_time_flag[0]])
             chosen_plan.append(['PG'])
 
-        # Training: skip entirely in optimize-only mode
+        # Training: skip entirely in optimize-only mode. Also skip the
+        # per-sample train loop when sql_vec is None (single-FROM-table
+        # queries: to_vec returned None -> no join features to train on; the
+        # value/MCTS nets index sql_vec and would crash with 'NoneType not
+        # subscriptable'). optimize() still runs (periodic gradient step).
         if not self.optimize_only:
-            for sample in samples_plan_with_time:
-                target_value = self.value_extractor.encode(sample[1])
-                self.model.train(plan_json = sample[0],sql_vec = sql_vec,target_value=target_value,mask = mask,is_train = True)
-                self.mcts_searcher.train(tree_feature = self.model.tree_builder.plan_to_feature_tree(sample[0]),sql_vec = sql_vec,target_value = sample[1],alias_set=alias)
+            if sql_vec is not None:
+                for sample in samples_plan_with_time:
+                    target_value = self.value_extractor.encode(sample[1])
+                    self.model.train(plan_json = sample[0],sql_vec = sql_vec,target_value=target_value,mask = mask,is_train = True)
+                    self.mcts_searcher.train(tree_feature = self.model.tree_builder.plan_to_feature_tree(sample[0]),sql_vec = sql_vec,target_value = sample[1],alias_set=alias)
 
             if self.hinter_times<1000 or self.hinter_times%10==0:
                 loss=  self.model.optimize()[0]
